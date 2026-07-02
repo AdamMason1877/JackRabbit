@@ -1,6 +1,5 @@
 # Jack Rabbit
-
-A branching, spatial chat canvas. Every reply lives in its own draggable window; highlight a phrase, branch into a child window with its own context, and the connector arrow ties them together. Designed for following one investigation across many forks without losing the thread.
+A new visual way of handling branching in LLM's thats more conducive to a streamlined workflow and better organization. Every reply lives in its own draggable window; highlight a phrase, branch into a child window with its own context, and the connector arrow ties them together. Designed for following one investigation across many forks without losing the thread.
 
 Built as a static React app. Bring your own Anthropic API key; nothing ever touches a server you don't own.
 
@@ -13,24 +12,11 @@ npm run dev
 
 Open the printed URL, click the gear in the header, paste an Anthropic API key (get one at <https://console.anthropic.com/settings/keys>), and start a thread.
 
-## Deploy to GitHub Pages (free)
-
-1. Push this repo to GitHub.
-2. **Settings → Pages → Build and deployment → Source = GitHub Actions.**
-3. Push to `main`. The included workflow at `.github/workflows/deploy.yml` builds with Vite and publishes to Pages on every push.
-
-A custom domain works the same way; add a `CNAME` file in `public/` and configure the domain under Settings → Pages.
-
-## Deploy to Cloudflare Pages
-
-- Build command: `npm run build`
-- Output directory: `dist`
-- No environment variables needed; the key is supplied by the user in the browser.
 
 ## BYOK and what stays where
 
 - The API key is stored in `localStorage["jr-key"]` on the user's machine, never sent anywhere except `api.anthropic.com`.
-- Browser calls Anthropic directly using the `anthropic-dangerous-direct-browser-access` header. There is no backend, no proxy, no analytics.
+- Browser calls Anthropic directly using the `anthropic-dangerous-direct-browser-access` header. There is no backend, no proxy, no analytics. Do not use on insecure networks, meant for home use.
 - Conversations autosave to `localStorage["thread-canvas-v1"]`. Use the Save / Open buttons in the header for portable JSON exports.
 
 ## What's in here
@@ -66,5 +52,5 @@ MIT. See `LICENSE`.
 
 
 # JackRabbit
-A new visual way of handling branching in LLM's thats more conducive to a streamlined workflow and better organization
->>>>>>> 98b75fd899bbf0c73cca792c1a1f76bbc8b4cd52
+
+
