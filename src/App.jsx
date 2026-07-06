@@ -369,7 +369,7 @@ const apiError = async (res) => { let detail = ""; try { const j = await res.jso
 
 // --- per-provider call shims; each returns assistant text or throws ---
 async function callAnthropic({ key, baseUrl, model, messages, effort, p }) {
-  const body = { model, max_tokens: 4096, messages };
+  const body = { model, max_tokens: 4096, messages: messages.map((m) => ({ role: m.role, content: anthropicContent(m) })) };
   const supported = modelSupportsEffort("anthropic", model);
   if (effort !== "off" && supported.includes(effort)) {
     const budget = p.effort[effort]; if (budget) body.thinking = { type: "enabled", budget_tokens: budget };
@@ -385,7 +385,7 @@ async function callAnthropic({ key, baseUrl, model, messages, effort, p }) {
 }
 
 async function callOpenAILike({ key, baseUrl, model, messages, effort, p, provider }) {
-  const body = { model, messages, max_completion_tokens: 4096 };
+  const body = { model, messages: messages.map((m) => ({ role: m.role, content: openaiContent(m) })), max_completion_tokens: 4096 };
   const supported = modelSupportsEffort(provider || "openai", model);
   if (effort !== "off" && supported.includes(effort)) {
     const eff = p.effort[effort]; if (eff) body.reasoning_effort = eff;
@@ -401,7 +401,7 @@ async function callOpenAILike({ key, baseUrl, model, messages, effort, p, provid
 }
 
 async function callGemini({ key, baseUrl, model, messages, effort, p }) {
-  const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+  const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: geminiParts(m) }));
   const generationConfig = { maxOutputTokens: 4096 };
   const supported = modelSupportsEffort("gemini", model);
   if (effort !== "off" && supported.includes(effort)) {
@@ -422,7 +422,7 @@ async function callGemini({ key, baseUrl, model, messages, effort, p }) {
 // Multi turn: the model emits tool_use blocks, we execute them, feed results back,
 // loop until the model emits a final text response with no further tool calls.
 async function callAnthropicLoop({ key, baseUrl, model, messages, effort, p, tools, executeTool, onToolStart, onToolEnd, maxHops = 10 }) {
-  let msgs = [...messages];
+  let msgs = messages.map((m) => ({ role: m.role, content: anthropicContent(m) }));
   const supported = modelSupportsEffort("anthropic", model);
   const apiTools = toolsForProvider("anthropic", tools);
   for (let hop = 0; hop < maxHops; hop++) {
@@ -458,7 +458,7 @@ async function callAnthropicLoop({ key, baseUrl, model, messages, effort, p, too
 }
 
 async function callOpenAILikeLoop({ key, baseUrl, model, messages, effort, p, provider, tools, executeTool, onToolStart, onToolEnd, maxHops = 10 }) {
-  let msgs = [...messages];
+  let msgs = messages.map((m) => ({ role: m.role, content: openaiContent(m) }));
   const supported = modelSupportsEffort(provider || "openai", model);
   const apiTools = toolsForProvider(provider || "openai", tools);
   for (let hop = 0; hop < maxHops; hop++) {
@@ -599,13 +599,85 @@ function fmtCost(p) { return p ? fmtMoney(p.in) + " / " + fmtMoney(p.out) : null
 
 // Normalize our message objects into a valid Anthropic message list:
 // merge consecutive same-role turns and guarantee the list starts with a user turn.
+// ---- image attachments (vision) ------------------------------------------
+// Read a File into { mediaType, data(base64), name }, downscaling very large images so the payload
+// stays within provider limits (~1568px on the long edge is the recommended sweet spot).
+function prepImage(file, maxDim = 1568) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    const parse = (u) => { const m = String(u).match(/^data:([^;]+);base64,(.*)$/); return m ? { mediaType: m[1], data: m[2] } : null; };
+    reader.onerror = () => reject(reader.error || new Error("read failed"));
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      const img = new Image();
+      img.onerror = () => { const p = parse(dataUrl); p ? resolve({ ...p, name: file.name }) : reject(new Error("decode failed")); };
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        if (scale >= 1 || !img.width) { const p = parse(dataUrl); return p ? resolve({ ...p, name: file.name }) : reject(new Error("bad image")); }
+        try {
+          const cw = Math.max(1, Math.round(img.width * scale)), ch = Math.max(1, Math.round(img.height * scale));
+          const canvas = document.createElement("canvas"); canvas.width = cw; canvas.height = ch;
+          canvas.getContext("2d").drawImage(img, 0, 0, cw, ch);
+          const p = parse(canvas.toDataURL("image/jpeg", 0.85));
+          p ? resolve({ ...p, name: file.name }) : reject(new Error("encode failed"));
+        } catch (e) { reject(e); }
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+const imgDataUrl = (im) => `data:${im.mediaType};base64,${im.data}`;
+
+// ---- text / data / code file attachments ---------------------------------
+const TEXT_FILE_EXT = /\.(json|jsonl|ndjson|txt|text|md|markdown|mdx|csv|tsv|log|ya?ml|toml|xml|svg|html?|css|scss|less|js|jsx|mjs|cjs|ts|tsx|py|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|rb|php|swift|scala|sh|bash|zsh|sql|graphql|gql|ini|conf|cfg|env|properties|gradle|dockerfile|makefile|ipynb|tex|rst|vue|svelte|dart|lua|r|pl|ps1)$/i;
+function isTextFile(f) {
+  const t = String(f.type || "");
+  if (t.startsWith("text/")) return true;
+  if (/(json|xml|javascript|typescript|x-yaml|yaml|x-sh|x-python|csv|markdown|graphql|toml)/i.test(t)) return true;
+  return TEXT_FILE_EXT.test(f.name || "");
+}
+const MAX_ATTACH_TEXT = 1_000_000; // ~1MB cap so a huge file can't blow the context/payload
+function readTextFile(f) {
+  return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(String(r.result)); r.onerror = () => reject(r.error || new Error("read failed")); r.readAsText(f); });
+}
+
+// materialize a { role, content, images } message into each provider's native multimodal shape
+function anthropicContent(m) {
+  if (!m.images || !m.images.length) return m.content || "";
+  const blocks = [];
+  if (m.content) blocks.push({ type: "text", text: m.content });
+  m.images.forEach((im) => blocks.push({ type: "image", source: { type: "base64", media_type: im.mediaType, data: im.data } }));
+  return blocks;
+}
+function openaiContent(m) {
+  if (!m.images || !m.images.length) return m.content || "";
+  const parts = [];
+  if (m.content) parts.push({ type: "text", text: m.content });
+  m.images.forEach((im) => parts.push({ type: "image_url", image_url: { url: imgDataUrl(im) } }));
+  return parts;
+}
+function geminiParts(m) {
+  const parts = [];
+  if (m.content) parts.push({ text: m.content });
+  (m.images || []).forEach((im) => parts.push({ inline_data: { mime_type: im.mediaType, data: im.data } }));
+  return parts.length ? parts : [{ text: "" }];
+}
+
 function toAPIMessages(msgs) {
   const merged = [];
   for (const m of msgs) {
     const role = m.role === "user" ? "user" : "assistant";
-    const content = m.content || "";
-    if (merged.length && merged[merged.length - 1].role === role) merged[merged.length - 1].content += "\n" + content;
-    else merged.push({ role, content });
+    // a quoted snippet the user attached rides in front of their question so the model sees it as context
+    let content = m.quote ? `Quoting from the conversation:\n"""\n${m.quote}\n"""\n\n${m.content || ""}` : (m.content || "");
+    // attached text/data/code files are appended so the model can read them
+    if (m.files && m.files.length) content += m.files.map((f) => `\n\n----- Attached file: ${f.name}${f.truncated ? " (truncated)" : ""} -----\n${f.text}`).join("");
+    const images = m.images && m.images.length ? m.images : null;
+    if (merged.length && merged[merged.length - 1].role === role) {
+      const prev = merged[merged.length - 1];
+      prev.content += "\n" + content;
+      if (images) prev.images = [...(prev.images || []), ...images];
+    } else merged.push({ role, content, ...(images ? { images } : {}) });
   }
   if (merged.length && merged[0].role !== "user") merged.unshift({ role: "user", content: "Context:" });
   return merged;
@@ -649,6 +721,7 @@ let _seq = 0;
 // Short title and one-line essence for the branch index.
 function clip(s, n) { s = String(s || "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s; }
 function nodeTitle(n) {
+  if (n.title) return n.title;   // user-set custom thread/window name wins
   if (n.synthFrom && n.synthFrom.length) {
     const u = n.messages.find((m) => m.role === "user" && !m.relate);
     return u && u.content ? clip(u.content, 40) : `Synthesis of ${n.synthFrom.length}`;
@@ -689,6 +762,8 @@ export default function App() {
   const [active, setActive] = useState("root");
   const [branchHint, setBranchHint] = useState(null);
   const [drafts, setDrafts] = useState({});
+  const [quotes, setQuotes] = useState({});   // per-node pending quote attached to the next question
+  const [attachments, setAttachments] = useState({});   // per-node pending image attachments
   const interaction = useRef(null);   // {type, id, mx, my, x, y, w, h}
   const viewportRef = useRef(null);
   const panRef = useRef(null);        // { sx, sy, sl, st } while panning the canvas
@@ -697,6 +772,11 @@ export default function App() {
   const [panning, setPanning] = useState(false);
   const [indexOpen, setIndexOpen] = useState(true);
   const [dark, setDark] = useState(() => { try { return localStorage.getItem("jr-theme") === "dark"; } catch { return false; } });
+  // ---- user preferences ----
+  const [showPrefs, setShowPrefs] = useState(false);
+  // which answer tab opens first on a new reply
+  const [defaultTab, setDefaultTab] = useState(() => { try { const v = localStorage.getItem("jr-default-tab"); return ["context", "summary", "sources", "action"].includes(v) ? v : "context"; } catch { return "context"; } });
+  useEffect(() => { try { localStorage.setItem("jr-default-tab", defaultTab); } catch {} }, [defaultTab]);
   const [lanesLocked, setLanesLocked] = useState(() => { try { return localStorage.getItem("jr-lanes") === "1"; } catch { return false; } });
   useEffect(() => { try { localStorage.setItem("jr-lanes", lanesLocked ? "1" : "0"); } catch {} }, [lanesLocked]);
   const [showTutorial, setShowTutorial] = useState(false);
@@ -1134,6 +1214,19 @@ export default function App() {
     setTimeout(() => laneRefs.current[id]?.scrollIntoView({ behavior: "smooth", inline: "center", block: "center" }), 0);
   };
 
+  // Jump to a specific main thread from the sidebar; opens its session first if it isn't current.
+  const pendingFocusRef = useRef(null);
+  const openThread = (sessId, threadId) => {
+    if (currentSession && currentSession.id === sessId) { focusNode(threadId); return; }
+    pendingFocusRef.current = threadId;
+    openSession(sessId);
+  };
+  // once the just-opened session's nodes are in place, focus the requested thread
+  useEffect(() => {
+    const id = pendingFocusRef.current;
+    if (id && nodes.some((n) => n.id === id)) { pendingFocusRef.current = null; setTimeout(() => focusNode(id), 40); }
+  }, [nodes]); // eslint-disable-line
+
   // x-overlap between two boxes; we treat two siblings as "in the same column" when their
   // horizontal ranges intersect by at least half the narrower one. Lets us auto-shift stacked
   // branches without dragging unrelated windows around.
@@ -1300,9 +1393,13 @@ export default function App() {
     let mx = 0;
     obj.nodes.forEach((n) => { const m = /^n(\d+)$/.exec(n.id || ""); if (m) mx = Math.max(mx, +m[1]); });
     _seq = mx;
-    setNodes(obj.nodes.map((n) => ({ ...n, loading: false, error: null })));
-    const firstOpen = obj.nodes.find((n) => !n.closed);
-    setActive(obj.active && obj.nodes.some((n) => n.id === obj.active && !n.closed) ? obj.active : (firstOpen ? firstOpen.id : null));
+    let loaded = obj.nodes.map((n) => ({ ...n, loading: false, error: null }));
+    // if every window in this session was closed, reopen its main threads so the canvas isn't
+    // blank (otherwise the chat shows "no threads open" with no way to bring them back)
+    if (loaded.length && loaded.every((n) => n.closed)) loaded = loaded.map((n) => (n.depth === 0 ? { ...n, closed: false } : n));
+    setNodes(loaded);
+    const firstOpen = loaded.find((n) => !n.closed);
+    setActive(obj.active && loaded.some((n) => n.id === obj.active && !n.closed) ? obj.active : (firstOpen ? firstOpen.id : null));
   };
 
   const saveToFile = () => {
@@ -1346,6 +1443,7 @@ export default function App() {
   const [collapsedFolders, setCollapsedFolders] = useState({}); // ui-only
   const [renamingFolder, setRenamingFolder] = useState(null);   // folder id being renamed
   const [renamingSession, setRenamingSession] = useState(null); // session id being renamed
+  const [renamingThread, setRenamingThread] = useState(null);   // main-thread node id being renamed
   const [dropTarget, setDropTarget] = useState(null);           // folder id (or "__unfiled") hovered during drag
   const [dragSessId, setDragSessId] = useState(null);           // session id being dragged
   // custom chat names. Session titles otherwise auto-derive from the first message on
@@ -1357,10 +1455,33 @@ export default function App() {
   // display name for a session: custom rename wins, else the derived title, else a placeholder
   const sessTitle = (s) => sessionTitles[s.id] || s.title || "(untitled)";
   const renameSession = (id, name) => setSessionTitles((m) => { const out = { ...m }; const v = (name || "").trim(); if (v) out[id] = v; else delete out[id]; return out; });
-  // left sidebar: "chats" (ChatGPT-style projects + sessions) vs "branches" (current-canvas tree)
-  const [sidebarTab, setSidebarTab] = useState(() => { try { return localStorage.getItem("jr-sidebar-tab") || "chats"; } catch { return "chats"; } });
+  // rename a specific main thread (stored on the node itself; empty reverts to the derived title)
+  const renameThread = (sessionId, nodeId, name) => {
+    const val = (name || "").trim() || undefined;
+    if (currentSession && currentSession.id === sessionId) { patch(nodeId, { title: val }); return; }
+    setSessionList((ls) => ls.map((s) => (s.id === sessionId ? { ...s, nodes: (s.nodes || []).map((n) => (n.id === nodeId ? { ...n, title: val } : n)) } : s)));
+    idb.get(sessionId).then((sess) => { if (sess) idb.put({ ...sess, nodes: (sess.nodes || []).map((n) => (n.id === nodeId ? { ...n, title: val } : n)) }); }).catch(() => {});
+  };
+  // Safety net: a mousedown anywhere outside an open rename field commits and closes it, so the
+  // rename caret can never linger in the sidebar — even when the click lands on something that
+  // suppresses the input's own blur (window headers, menus, etc. call preventDefault on mousedown).
+  useEffect(() => {
+    if (renamingSession == null && renamingFolder == null && renamingThread == null) return;
+    const onDown = (e) => {
+      const inp = document.querySelector("input[data-rename]");
+      if (inp && e.target === inp) return;   // still interacting with the field
+      if (inp) {
+        const kind = inp.getAttribute("data-rename"), id = inp.getAttribute("data-id"), val = inp.value;
+        if (kind === "session") renameSession(id, val);
+        else if (kind === "folder") { const v = (val || "").trim(); if (v) renameFolder(id, v); }
+        else if (kind === "thread") renameThread(inp.getAttribute("data-sess"), id, val);
+      }
+      setRenamingSession(null); setRenamingFolder(null); setRenamingThread(null);
+    };
+    const tid = setTimeout(() => document.addEventListener("mousedown", onDown, true), 0);
+    return () => { clearTimeout(tid); document.removeEventListener("mousedown", onDown, true); };
+  }, [renamingSession, renamingFolder, renamingThread]); // eslint-disable-line
   const [chatQuery, setChatQuery] = useState("");
-  useEffect(() => { try { localStorage.setItem("jr-sidebar-tab", sidebarTab); } catch {} }, [sidebarTab]);
 
   const createFolder = () => {
     const id = "fld-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -1541,6 +1662,34 @@ export default function App() {
     setTimeout(() => laneRefs.current[id]?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" }), 60);
   }
 
+  // Attach the selected text to this node's composer as context for the next question in the thread.
+  function quoteAsContext(nodeId, quote) {
+    const q = String(quote || "").replace(/\s+/g, " ").trim();
+    if (!q) return;
+    setQuotes((qs) => ({ ...qs, [nodeId]: q }));
+    setActive(nodeId);
+    setBranchHint(null);
+    window.getSelection()?.removeAllRanges();
+    setTimeout(() => laneRefs.current[nodeId]?.querySelector('input[data-composer="1"]')?.focus(), 40);
+  }
+  const clearQuote = (nodeId) => setQuotes((qs) => { if (!(nodeId in qs)) return qs; const o = { ...qs }; delete o[nodeId]; return o; });
+
+  // ---- pending attachments for the next question: images (vision) or text/data/code files ----
+  const addFiles = async (nodeId, files) => {
+    const items = [];
+    for (const f of Array.from(files || [])) {
+      if (!f) continue;
+      if (String(f.type).startsWith("image/")) { try { items.push({ kind: "image", ...(await prepImage(f)) }); } catch {} }
+      else if (isTextFile(f)) {
+        try { let text = await readTextFile(f); const truncated = text.length > MAX_ATTACH_TEXT; if (truncated) text = text.slice(0, MAX_ATTACH_TEXT); items.push({ kind: "file", name: f.name || "file", text, ...(truncated ? { truncated: true } : {}) }); } catch {}
+      }
+      // other binary types are skipped
+    }
+    if (items.length) setAttachments((a) => ({ ...a, [nodeId]: [...(a[nodeId] || []), ...items] }));
+  };
+  const removeImage = (nodeId, idx) => setAttachments((a) => { const cur = a[nodeId] || []; const next = cur.filter((_, i) => i !== idx); const o = { ...a }; if (next.length) o[nodeId] = next; else delete o[nodeId]; return o; });
+  const clearImages = (nodeId) => setAttachments((a) => { if (!(nodeId in a)) return a; const o = { ...a }; delete o[nodeId]; return o; });
+
   // Spawn a synthesis node that ingests N source threads at once. The new node sits to the
   // right of the rightmost source, vertically centered across the source span. Its messages
   // are empty; the API chain is composed from every source's chain when send() runs.
@@ -1596,12 +1745,19 @@ export default function App() {
   }
 
   function send(nodeId) {
-    const text = (drafts[nodeId] || "").trim(); if (!text) return;
+    const text = (drafts[nodeId] || "").trim();
+    const items = attachments[nodeId] || [];
+    const imgs = items.filter((it) => it.kind === "image").map(({ mediaType, data, name }) => ({ mediaType, data, name }));
+    const files = items.filter((it) => it.kind === "file").map(({ name, text, truncated }) => ({ name, text, ...(truncated ? { truncated: true } : {}) }));
+    if (!text && !imgs.length && !files.length) return;
     commit();
     const node = nodes.find((n) => n.id === nodeId);
-    const msg = { role: "user", content: text };
+    const quote = (quotes[nodeId] || "").trim();
+    const msg = { role: "user", content: text, ...(quote ? { quote } : {}), ...(imgs.length ? { images: imgs } : {}), ...(files.length ? { files } : {}) };
     append(nodeId, msg);
     setDrafts((d) => ({ ...d, [nodeId]: "" }));
+    if (quote) clearQuote(nodeId);
+    if (items.length) clearImages(nodeId);
     bringFront(nodeId);
     // synthesis nodes feed the union of every source's full chain; branches walk the parent lineage
     const ctx = node.synthFrom ? synthChain(node) : lineage(nodeId).flatMap((n) => n.messages.filter((m) => !m.relate));
@@ -1661,6 +1817,7 @@ export default function App() {
             { type: "item", label: "New thread", shortcut: "⌘N", action: newMainThread },
             { type: "item", label: "Sessions…", action: () => { reloadSessionList(); setShowSessions(true); } },
             { type: "separator" },
+            { type: "item", label: "Preferences…", action: () => setShowPrefs(true) },
             { type: "item", label: "Settings…", action: () => setShowKey(true) },
           ]} />
           <Menu label="Edit" items={[
@@ -1721,6 +1878,22 @@ export default function App() {
           ))}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          {/* tiled / scroll-locked indicator — click to release */}
+          {tiled && (
+            <button onClick={() => setTiled(false)} title="canvas scrolling is locked while tiled — click to unlock (or drag/zoom a window)"
+              style={{ display: "flex", alignItems: "center", gap: 6, background: C.card, border: `1px solid ${C.trunk}`, borderRadius: 7, padding: "4px 9px", cursor: "pointer", color: C.ink, fontSize: 11, fontWeight: 600, flexShrink: 0 }}>
+              <span style={{ color: C.trunk }}>▤ Tiled</span>
+              <span style={{ color: C.muted, fontWeight: 500 }}>scroll locked</span>
+              <span style={{ color: C.muted, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 10, borderLeft: `1px solid ${C.hairline}`, paddingLeft: 6 }}>unlock ✕</span>
+            </button>
+          )}
+          {/* zoom control */}
+          <div style={{ display: "flex", alignItems: "center", gap: 1, border: `1px solid ${C.hairline}`, borderRadius: 7, padding: 2, background: C.card, flexShrink: 0 }}>
+            <button onClick={() => setZoomAt(zoom * 0.8)} title="zoom out" style={{ ...zbtn, width: 24, height: 24, fontSize: 15 }}>－</button>
+            <button onClick={() => setZoomAt(1)} title="reset to 100%" style={{ ...zbtn, width: 40, height: 24, fontSize: 10.5, fontFamily: "ui-monospace, monospace" }}>{Math.round(zoom * 100)}%</button>
+            <button onClick={() => setZoomAt(zoom * 1.25)} title="zoom in" style={{ ...zbtn, width: 24, height: 24, fontSize: 15 }}>＋</button>
+            <button onClick={() => fitView()} title="zoom to fit (F fits the active window)" style={{ ...zbtn, width: 24, height: 24, fontSize: 13 }}>⤢</button>
+          </div>
           <button onClick={() => setShowKey(true)} title={`${PROVIDERS[provider].label} · ${model}${effort !== "off" ? " · " + effort : ""}`}
             style={{ fontSize: 11, padding: "4px 9px", borderRadius: 6, border: `1px solid ${C.hairline}`, background: C.card, color: C.muted, cursor: "pointer", fontFamily: "ui-monospace, Menlo, monospace", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {model}{effort !== "off" ? " · " + effort : ""}
@@ -1741,15 +1914,12 @@ export default function App() {
         {/* branch index (left panel) */}
         {indexOpen ? (
           <div style={{ width: 232, flexShrink: 0, borderRight: `1px solid ${C.hairline}`, background: C.cardAlt, display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "6px 8px", borderBottom: `1px solid ${C.hairline}` }}>
-              {[["chats", "Chats"], ["branches", "Branches"]].map(([id, label]) => (
-                <button key={id} onClick={() => setSidebarTab(id)}
-                  style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 9, letterSpacing: 1, textTransform: "uppercase", padding: "4px 8px", borderRadius: 5, border: "none", cursor: "pointer", background: sidebarTab === id ? C.userBubble : "transparent", color: sidebarTab === id ? C.ink : C.muted, fontWeight: sidebarTab === id ? 700 : 500 }}>{label}</button>
-              ))}
+            <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "7px 10px", borderBottom: `1px solid ${C.hairline}` }}>
+              <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 9, letterSpacing: 1.1, textTransform: "uppercase", color: C.muted }}>Chats</span>
               <button onClick={() => setIndexOpen(false)} title="hide" style={{ marginLeft: "auto", border: "none", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 12, lineHeight: 1 }}>‹</button>
             </div>
 
-            {sidebarTab === "chats" ? (
+            {(
               <>
                 <div style={{ display: "flex", gap: 6, padding: "8px 8px 4px" }}>
                   <button onClick={newSession} title="start a new chat" style={{ flex: 1, fontSize: 11.5, padding: "6px 8px", borderRadius: 7, border: "none", background: C.trunk, color: "#fff", fontWeight: 600, cursor: "pointer" }}>＋ New chat</button>
@@ -1791,7 +1961,7 @@ export default function App() {
                           style={{ display: "flex", alignItems: "center", gap: 6, padding: `5px 8px 5px ${indented ? 22 : 10}px`, cursor: editing ? "default" : (isCurrent ? "default" : "pointer"), opacity: dragSessId === s.id ? 0.4 : 1, background: isCurrent ? C.userBubble : "transparent", borderLeft: `2px solid ${isCurrent ? C.trunk : "transparent"}` }}>
                           <span style={{ width: 6, height: 6, borderRadius: "50%", background: isCurrent ? C.trunk : C.hairline, flexShrink: 0 }} />
                           {editing ? (
-                            <input autoFocus defaultValue={sessionTitles[s.id] || s.title || ""} onClick={(e) => e.stopPropagation()}
+                            <input autoFocus data-rename="session" data-id={s.id} defaultValue={sessionTitles[s.id] || s.title || ""} onClick={(e) => e.stopPropagation()}
                               onBlur={(e) => { renameSession(s.id, e.target.value); setRenamingSession(null); }}
                               onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setRenamingSession(null); }}
                               placeholder="chat name…"
@@ -1811,6 +1981,46 @@ export default function App() {
                       );
                     };
 
+                    // a chat/session row plus, when its canvas holds more than one main thread,
+                    // those threads listed beneath it (click to jump to it, reopening if it was closed).
+                    // Closed main threads stay listed (dimmed) so closing a window doesn't make a thread
+                    // vanish from its folder — clicking one reopens it on the canvas.
+                    const sessionAndThreads = (s, indented) => {
+                      const isCur = currentSession && currentSession.id === s.id;
+                      const src = isCur ? nodes : (s.nodes || []);
+                      const threads = src.filter((n) => n.depth === 0);
+                      return (
+                        <React.Fragment key={s.id}>
+                          {chatRow(s, indented)}
+                          {threads.length > 1 && threads.map((t) => {
+                            const on = isCur && active === t.id;
+                            const tEditing = renamingThread === t.id;
+                            const tClosed = !!t.closed;
+                            return (
+                              <div key={s.id + "/" + t.id} className="sb-row" onClick={() => { if (tEditing) return; openThread(s.id, t.id); }} title={tEditing ? undefined : (tClosed ? nodeTitle(t) + " (closed — click to reopen)" : nodeTitle(t))}
+                                style={{ display: "flex", alignItems: "center", gap: 6, padding: `3px 8px 3px ${(indented ? 22 : 10) + 14}px`, cursor: tEditing ? "default" : "pointer", opacity: tClosed && !on ? 0.5 : 1, background: on ? C.userBubble : "transparent", borderLeft: `2px solid ${on ? depthColor(0) : "transparent"}` }}>
+                                <span style={{ width: 4, height: 4, borderRadius: "50%", background: depthColor(0), flexShrink: 0, opacity: 0.75 }} />
+                                {tEditing ? (
+                                  <input autoFocus data-rename="thread" data-id={t.id} data-sess={s.id} defaultValue={t.title || nodeTitle(t)} onClick={(e) => e.stopPropagation()}
+                                    onBlur={(e) => { renameThread(s.id, t.id, e.target.value); setRenamingThread(null); }}
+                                    onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setRenamingThread(null); }}
+                                    placeholder="thread name…"
+                                    style={{ flex: 1, minWidth: 0, border: `1px solid ${C.trunk}`, borderRadius: 4, padding: "1px 5px", fontSize: 10.5, fontWeight: 600, color: C.ink, background: C.canvas, outline: "none" }} />
+                                ) : (
+                                  <span style={{ flex: 1, minWidth: 0, fontSize: 10.5, color: on ? C.ink : C.muted, fontWeight: on ? 600 : 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nodeTitle(t)}</span>
+                                )}
+                                {!tEditing && tClosed && <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 7.5, letterSpacing: 0.3, textTransform: "uppercase", color: C.muted, border: `1px solid ${C.hairline}`, borderRadius: 3, padding: "0 3px", flexShrink: 0 }}>hidden</span>}
+                                {!tEditing && (
+                                  <button className="sb-del" onClick={(e) => { e.stopPropagation(); setRenamingThread(t.id); }}
+                                    title="rename thread" style={{ border: "none", background: "transparent", color: C.muted, fontSize: 9.5, lineHeight: 1, padding: "2px 2px", cursor: "pointer", flexShrink: 0 }}>✎</button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </React.Fragment>
+                      );
+                    };
+
                     return (
                       <>
                         {folders.map((f) => {
@@ -1826,7 +2036,7 @@ export default function App() {
                                   style={{ border: "none", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 9, width: 10, flexShrink: 0 }}>{collapsed ? "▸" : "▾"}</button>
                                 <span style={{ fontSize: 11, flexShrink: 0 }}>🗀</span>
                                 {renamingFolder === f.id ? (
-                                  <input autoFocus defaultValue={f.name} onClick={(e) => e.stopPropagation()}
+                                  <input autoFocus data-rename="folder" data-id={f.id} defaultValue={f.name} onClick={(e) => e.stopPropagation()}
                                     onBlur={(e) => { const v = e.target.value.trim(); if (v) renameFolder(f.id, v); setRenamingFolder(null); }}
                                     onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setRenamingFolder(null); }}
                                     style={{ flex: 1, minWidth: 0, border: `1px solid ${C.trunk}`, borderRadius: 4, padding: "1px 5px", fontSize: 11, fontWeight: 600, color: C.ink, background: C.canvas, outline: "none" }} />
@@ -1839,7 +2049,7 @@ export default function App() {
                                 <button className="sb-del" onClick={() => askConfirm({ title: "Delete folder?", message: `Delete folder "${f.name}"? Its ${list.length} chat${list.length === 1 ? "" : "s"} won't be deleted — they'll move to Unfiled.`, okLabel: "Delete folder", danger: true, onOk: () => removeFolder(f.id) })}
                                   title="delete folder (chats move to Unfiled)" style={{ border: "none", background: "transparent", color: "#A8324E", cursor: "pointer", fontSize: 11, padding: "0 2px", flexShrink: 0 }}>×</button>
                               </div>
-                              {!collapsed && (list.length ? list.map((s) => chatRow(s, true))
+                              {!collapsed && (list.length ? list.map((s) => sessionAndThreads(s, true))
                                 : <div style={{ padding: "5px 8px 5px 24px", fontSize: 9.5, color: C.muted, fontStyle: "italic" }}>drop chats here</div>)}
                             </div>
                           );
@@ -1852,50 +2062,16 @@ export default function App() {
                               <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 8.5, letterSpacing: 0.8, textTransform: "uppercase", color: C.muted, flex: 1 }}>Unfiled</span>
                               <span style={{ fontSize: 9, color: C.muted, fontFamily: "ui-monospace, Menlo, monospace" }}>{unfiled.length}</span>
                             </div>
-                            {unfiled.map((s) => chatRow(s, false))}
+                            {unfiled.map((s) => sessionAndThreads(s, false))}
                           </div>
                         )}
-                        {folders.length === 0 && unfiled.map((s) => chatRow(s, false))}
+                        {folders.length === 0 && unfiled.map((s) => sessionAndThreads(s, false))}
                         {!matches.length && !folders.length && <div style={{ padding: "16px 12px", textAlign: "center", color: C.muted, fontSize: 11 }}>{q ? "no matches" : "no chats yet"}</div>}
                       </>
                     );
                   })()}
                 </div>
               </>
-            ) : (
-            <div style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}>
-              {orderTree(nodes).map((n) => {
-                const kids = nodes.filter((c) => c.parentId === n.id && !c.closed);
-                const anyCollapsed = kids.some((k) => k.min);
-                return (
-                <div key={n.id} className="sb-row" onClick={() => focusNode(n.id)} title={n.closed ? "reopen on canvas" : undefined}
-                  style={{ display: "flex", width: "100%", textAlign: "left", cursor: "pointer", opacity: n.closed ? 0.5 : 1, background: sel.includes(n.id) || n.id === active ? C.userBubble : "transparent", padding: "4px 8px 4px 3px", borderLeft: `2px solid ${n.id === active ? depthColor(n.depth) : "transparent"}` }}>
-                  {Array.from({ length: n.depth }).map((_, k) => (
-                    <span key={k} style={{ width: 11, flexShrink: 0, alignSelf: "stretch", borderLeft: `1px solid ${C.hairline}`, marginLeft: 5 }} />
-                  ))}
-                  <div style={{ minWidth: 0, flex: 1, paddingLeft: 5 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ width: 6, height: 6, borderRadius: "50%", background: depthColor(n.depth), flexShrink: 0 }} />
-                      <span style={{ fontSize: 11, color: C.ink, fontWeight: n.id === active ? 600 : 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nodeTitle(n)}</span>
-                      <div style={{ marginLeft: "auto", flexShrink: 0, display: "flex", alignItems: "center", gap: 3 }}>
-                        {n.closed && <span style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 8, letterSpacing: 0.3, textTransform: "uppercase", color: C.muted, border: `1px solid ${C.hairline}`, borderRadius: 3, padding: "0 3px" }}>hidden</span>}
-                        {!n.closed && kids.length > 0 && (
-                          <button className="sb-act" onClick={(e) => { e.stopPropagation(); toggleChildren(n.id); }}
-                            title={anyCollapsed ? `expand all ${kids.length} branches below` : `collapse all ${kids.length} branches below`}
-                            style={{ border: `1px solid ${C.hairline}`, background: C.card, color: C.muted, fontSize: 9, lineHeight: 1, padding: "1px 4px", borderRadius: 3, cursor: "pointer", fontFamily: "ui-monospace, Menlo, monospace" }}>
-                            {anyCollapsed ? "▾ all" : "▸ all"}
-                          </button>
-                        )}
-                        <button className="sb-del" onClick={(e) => { e.stopPropagation(); deleteNodeForever(n.id); }} title="delete permanently"
-                          style={{ border: `1px solid ${C.hairline}`, background: C.card, color: "#A8324E", fontSize: 11, lineHeight: 1, padding: "1px 4px", borderRadius: 3, cursor: "pointer" }}>🗑</button>
-                      </div>
-                    </div>
-                    <div style={{ fontSize: 9.5, color: C.muted, marginTop: 1, marginLeft: 11, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", lineHeight: 1.3 }}>{nodeEssence(n)}</div>
-                  </div>
-                </div>
-                );
-              })}
-            </div>
             )}
           </div>
         ) : (
@@ -1906,7 +2082,13 @@ export default function App() {
         <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
         <div ref={viewportRef} style={{ position: "absolute", inset: 0, overflow: tiled ? "hidden" : "auto" }}>
         <div style={{ position: "relative", width: worldW * zoom, height: worldH * zoom, minWidth: "100%", minHeight: "100%" }}>
-        <div onMouseDown={startPan} style={{ position: "absolute", top: 0, left: 0, width: worldW, height: worldH, transform: `scale(${zoom})`, transformOrigin: "0 0", cursor: panning ? "grabbing" : (tiled ? "default" : "grab") }}>
+        <div onMouseDown={startPan} style={{ position: "absolute", top: 0, left: 0, width: worldW, height: worldH,
+            // At 100% drop the transform entirely: a `scale(1)` still makes this a transformed
+            // ancestor, and Chromium mispaints text-input carets inside transformed containers
+            // (the caret lands away from the input — the "cursor in the wrong place" bug). No
+            // transform at 100% (the default and what Tile uses) = caret renders correctly.
+            transform: zoom === 1 ? "none" : `scale(${zoom})`, transformOrigin: "0 0",
+            cursor: panning ? "grabbing" : (tiled ? "default" : "grab") }}>
 
           {/* connector + overlay layer (behind windows) */}
           <svg width={worldW} height={worldH} style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 1 }}>
@@ -1931,6 +2113,7 @@ export default function App() {
             <Lane key={n.id} node={n} color={depthColor(n.depth)} isActive={n.id === active} selected={sel.includes(n.id)}
               animate={!interacting}
               dark={dark}
+              defaultTab={defaultTab}
               highlights={nodes.filter((c) => c.parentId === n.id && !c.closed && c.sourceQuote).map((c) => ({ quote: c.sourceQuote, color: depthColor(c.depth) }))}
               synthSources={n.synthFrom ? n.synthFrom.map((pid) => { const p = nodes.find((x) => x.id === pid); return p ? { id: p.id, color: depthColor(p.depth), title: nodeTitle(p) } : null; }).filter(Boolean) : null}
               laneRef={(el) => (laneRefs.current[n.id] = el)}
@@ -1941,6 +2124,8 @@ export default function App() {
               onToggleMin={() => toggleMin(n.id)}
               onDelete={() => closeNode(n.id)}
               draft={drafts[n.id] || ""} setDraft={(v) => setDrafts((d) => ({ ...d, [n.id]: v }))}
+              pendingQuote={quotes[n.id] || null} onClearQuote={() => clearQuote(n.id)}
+              attachments={attachments[n.id] || null} onAddFiles={(files) => addFiles(n.id, files)} onRemoveImage={(idx) => removeImage(n.id, idx)}
               onSend={() => send(n.id)}
               onAutoHeight={(h) => setHeightAndPush(n.id, h)}
               onAutoFit={() => patch(n.id, { manual: false })} />
@@ -1985,24 +2170,6 @@ export default function App() {
             <button onClick={newMainThread} style={{ background: C.trunk, color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", pointerEvents: "auto" }}>＋ New main thread</button>
           </div>
         )}
-
-        {/* tiled / scroll-locked indicator — click to release */}
-        {tiled && (
-          <button onClick={() => setTiled(false)} title="canvas scrolling is locked while tiled — click to unlock (or drag/zoom a window)"
-            style={{ position: "absolute", right: 12, bottom: 56, display: "flex", alignItems: "center", gap: 6, background: C.card, border: `1px solid ${C.trunk}`, borderRadius: 9, padding: "6px 10px", boxShadow: `0 4px 14px var(--shadow)`, zIndex: 50, cursor: "pointer", color: C.ink, fontSize: 11.5, fontWeight: 600 }}>
-            <span style={{ color: C.trunk }}>▤ Tiled</span>
-            <span style={{ color: C.muted, fontWeight: 500 }}>scroll locked</span>
-            <span style={{ color: C.muted, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 10, borderLeft: `1px solid ${C.hairline}`, paddingLeft: 6 }}>unlock ✕</span>
-          </button>
-        )}
-
-        {/* zoom control */}
-        <div style={{ position: "absolute", right: 12, bottom: 12, display: "flex", alignItems: "center", gap: 2, background: C.card, border: `1px solid ${C.hairline}`, borderRadius: 9, padding: 3, boxShadow: `0 4px 14px var(--shadow)`, zIndex: 50 }}>
-          <button onClick={() => setZoomAt(zoom * 0.8)} title="zoom out" style={zbtn}>－</button>
-          <button onClick={() => setZoomAt(1)} title="reset to 100%" style={{ ...zbtn, width: 46, fontSize: 11, fontFamily: "ui-monospace, monospace" }}>{Math.round(zoom * 100)}%</button>
-          <button onClick={() => setZoomAt(zoom * 1.25)} title="zoom in" style={zbtn}>＋</button>
-          <button onClick={() => fitView()} title="zoom to fit (F fits the active window)" style={{ ...zbtn, fontSize: 14 }}>⤢</button>
-        </div>
         </div>
       </div>
 
@@ -2234,6 +2401,50 @@ export default function App() {
         </div>
       )}
 
+      {/* preferences dialog */}
+      {showPrefs && (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setShowPrefs(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+          <div style={{ background: C.card, border: `1px solid ${C.hairline}`, borderRadius: 12, padding: 18, width: 460, maxWidth: "100%", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 20px 50px rgba(0,0,0,0.3)" }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: C.ink, marginBottom: 4 }}>Preferences</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 16 }}>Saved in this browser and applied on every load.</div>
+
+            {(() => {
+              const seg = (opts, current, onPick) => (
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {opts.map(([val, lbl]) => {
+                    const on = current === val;
+                    return (
+                      <button key={val} onClick={() => onPick(val)}
+                        style={{ flex: "1 1 auto", minWidth: 0, padding: "7px 10px", borderRadius: 8, border: `1px solid ${on ? C.trunk : C.hairline}`, background: on ? C.trunk : C.card, color: on ? "#fff" : C.ink, fontWeight: on ? 600 : 500, fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap" }}>{lbl}</button>
+                    );
+                  })}
+                </div>
+              );
+              return (
+                <>
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 6, fontFamily: "ui-monospace, monospace", letterSpacing: 0.5, textTransform: "uppercase" }}>Theme</div>
+                    {seg([["light", "☀ Light"], ["dark", "☾ Dark"]], dark ? "dark" : "light", (v) => setDark(v === "dark"))}
+                  </div>
+
+                  <div style={{ marginBottom: 4 }}>
+                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 6, fontFamily: "ui-monospace, monospace", letterSpacing: 0.5, textTransform: "uppercase" }}>Default answer tab</div>
+                    {seg([["context", "Context"], ["summary", "Summary"], ["sources", "Source"], ["action", "Action"]], defaultTab, setDefaultTab)}
+                    <div style={{ fontSize: 10.5, color: C.muted, marginTop: 6 }}>Which tab opens first on a new reply. Applies to answers generated from now on.</div>
+                  </div>
+                </>
+              );
+            })()}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+              <button onClick={() => setShowPrefs(false)}
+                style={{ fontSize: 12.5, padding: "6px 14px", borderRadius: 7, border: "none", background: C.trunk, color: "#fff", cursor: "pointer", fontWeight: 600 }}>Done</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* settings dialog */}
       {showKey && (
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setShowKey(false); }}
@@ -2363,6 +2574,11 @@ export default function App() {
           <button onMouseDown={(e) => e.preventDefault()} onClick={() => createBranch(branchHint.nodeId, branchHint.quote)}
             style={{ background: "#1f2430", color: "#fff", border: "none", borderRadius: 7, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", boxShadow: "0 6px 18px rgba(0,0,0,0.22)", whiteSpace: "nowrap" }}>
             ⎇ Branch this →
+          </button>
+          <button onMouseDown={(e) => e.preventDefault()} onClick={() => quoteAsContext(branchHint.nodeId, branchHint.quote)}
+            title="attach this text as context for your next question in this thread"
+            style={{ background: C.trunk, color: "#fff", border: "none", borderRadius: 7, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", boxShadow: "0 6px 18px rgba(0,0,0,0.22)", whiteSpace: "nowrap" }}>
+            ❝ Quote as context
           </button>
           {(nodes.find((n) => n.id === branchHint.nodeId)?.depth > 0) && (
             <button onMouseDown={(e) => e.preventDefault()} onClick={() => { relateToOrigin(branchHint.nodeId, branchHint.quote); setBranchHint(null); window.getSelection()?.removeAllRanges(); }}
@@ -2810,8 +3026,8 @@ function CodeBlock({ lang, lines, highlights }) {
   );
 }
 
-function TabbedAnswer({ tabs, color, onSelect, highlights }) {
-  const [tab, setTab] = useState("context");
+function TabbedAnswer({ tabs, color, onSelect, highlights, defaultTab }) {
+  const [tab, setTab] = useState(() => (["context", "summary", "sources", "action"].includes(defaultTab) ? defaultTab : "context"));
   const labels = [["context", "Context"], ["summary", "Summary"], ["sources", "Authoritative source"], ["action", "Suggestive action"]];
   const body = tabs[tab] || "";
   // colors of any branches whose source text lives inside this tab (deduped)
@@ -2847,7 +3063,8 @@ function TabbedAnswer({ tabs, color, onSelect, highlights }) {
   );
 }
 
-function Lane({ node, color, isActive, selected, highlights, synthSources, animate, dark, laneRef, onFocus, onDragStart, onResizeStart, onSelect, onToggleMin, onDelete, draft, setDraft, onSend, onAutoHeight, onAutoFit }) {
+function Lane({ node, color, isActive, selected, highlights, synthSources, animate, dark, defaultTab, laneRef, onFocus, onDragStart, onResizeStart, onSelect, onToggleMin, onDelete, draft, setDraft, pendingQuote, onClearQuote, attachments, onAddFiles, onRemoveImage, onSend, onAutoHeight, onAutoFit }) {
+  const fileInputRef = useRef(null);
   const scrollRef = useRef(null);
   const contentRef = useRef(null);
   const isSynth = !!(synthSources && synthSources.length);
@@ -2979,7 +3196,28 @@ function Lane({ node, color, isActive, selected, highlights, synthSources, anima
         )}
         {node.messages.map((m, i) =>
           m.role === "user" ? (
-            <div key={i} style={{ alignSelf: "flex-end", maxWidth: "88%", background: C.userBubble, color: C.ink, padding: "8px 11px", borderRadius: "10px 10px 2px 10px", fontSize: 13.5, lineHeight: 1.45 }}>{applyHighlights(m.content, highlights, "u" + i)}</div>
+            <div key={i} style={{ alignSelf: "flex-end", maxWidth: "88%", background: C.userBubble, color: C.ink, padding: "8px 11px", borderRadius: "10px 10px 2px 10px", fontSize: 13.5, lineHeight: 1.45 }}>
+              {m.quote && (
+                <div style={{ borderLeft: `3px solid ${color}`, paddingLeft: 8, marginBottom: 6, fontSize: 12, fontStyle: "italic", color: C.muted, lineHeight: 1.4, maxHeight: 88, overflow: "hidden" }}>“{m.quote}”</div>
+              )}
+              {m.images && m.images.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: (m.content || (m.files && m.files.length)) ? 6 : 0 }}>
+                  {m.images.map((im, k) => (
+                    <img key={k} src={imgDataUrl(im)} alt={im.name || "image"} style={{ maxWidth: 160, maxHeight: 160, borderRadius: 8, border: `1px solid ${C.hairline}`, display: "block" }} />
+                  ))}
+                </div>
+              )}
+              {m.files && m.files.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: m.content ? 6 : 0 }}>
+                  {m.files.map((f, k) => (
+                    <span key={k} title={f.name} style={{ display: "inline-flex", alignItems: "center", gap: 5, background: C.card, border: `1px solid ${C.hairline}`, borderRadius: 7, padding: "3px 8px", fontSize: 11.5, color: C.ink, maxWidth: "100%", overflow: "hidden" }}>
+                      <span>📄</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}{f.truncated ? " (truncated)" : ""}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {m.content && applyHighlights(m.content, highlights, "u" + i)}
+            </div>
           ) : m.role === "tool" ? (
             <ToolBlock key={i} msg={m} color={color} onSelect={onSelect} />
           ) : m.relate ? (
@@ -2988,7 +3226,7 @@ function Lane({ node, color, isActive, selected, highlights, synthSources, anima
               <div onMouseUp={onSelect} style={{ padding: "9px 11px", fontSize: 13.5, lineHeight: 1.5, color: C.ink, cursor: "text" }}>{renderMarkdown(m.content, highlights)}</div>
             </div>
           ) : m.tabs ? (
-            <TabbedAnswer key={i} tabs={m.tabs} color={color} onSelect={onSelect} highlights={highlights} />
+            <TabbedAnswer key={i} tabs={m.tabs} color={color} onSelect={onSelect} highlights={highlights} defaultTab={defaultTab} />
           ) : (
             <div key={i} onMouseUp={onSelect} style={{ alignSelf: "flex-start", maxWidth: "94%", background: C.card, color: C.ink, padding: "9px 11px", border: `1px solid ${C.hairline}`, borderRadius: "10px 10px 10px 2px", fontSize: 13.5, lineHeight: 1.5, cursor: "text" }}>{renderMarkdown(m.content, highlights)}</div>
           )
@@ -2998,12 +3236,47 @@ function Lane({ node, color, isActive, selected, highlights, synthSources, anima
         </div>
       </div>
 
-      {/* input */}
-      <div style={{ padding: 8, borderTop: `1px solid ${C.hairline}`, display: "flex", gap: 6, flexShrink: 0 }}>
-        <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") onSend(); }}
-          placeholder={node.depth === 0 ? "ask anything…" : "ask about this…"}
-          style={{ flex: 1, border: `1px solid ${C.hairline}`, borderRadius: 8, padding: "7px 9px", fontSize: 13, outline: "none", color: C.ink, background: C.canvas }} />
-        <button onClick={onSend} disabled={node.loading} style={{ background: color, color: "#fff", border: "none", borderRadius: 8, padding: "0 12px", fontSize: 13, fontWeight: 600, cursor: node.loading ? "default" : "pointer", opacity: node.loading ? 0.5 : 1 }}>↑</button>
+      {/* input (drop image files here) */}
+      <div onDragOver={(e) => { if (Array.from(e.dataTransfer.types || []).includes("Files")) e.preventDefault(); }}
+        onDrop={(e) => { if (e.dataTransfer.files && e.dataTransfer.files.length) { e.preventDefault(); onAddFiles(e.dataTransfer.files); } }}
+        style={{ padding: 8, borderTop: `1px solid ${C.hairline}`, display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+        {attachments && attachments.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {attachments.map((it, i) => it.kind === "image" ? (
+              <div key={i} title={it.name || "image"} style={{ position: "relative", width: 46, height: 46, borderRadius: 7, overflow: "hidden", border: `1px solid ${C.hairline}`, flexShrink: 0 }}>
+                <img src={imgDataUrl(it)} alt={it.name || "image"} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                <button onClick={() => onRemoveImage(i)} title="remove image"
+                  style={{ position: "absolute", top: 1, right: 1, width: 15, height: 15, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.62)", color: "#fff", cursor: "pointer", fontSize: 11, lineHeight: "15px", padding: 0 }}>×</button>
+              </div>
+            ) : (
+              <div key={i} title={it.name} style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%", background: C.cardAlt, border: `1px solid ${C.hairline}`, borderRadius: 7, padding: "5px 7px", flexShrink: 0 }}>
+                <span style={{ fontSize: 13, flexShrink: 0 }}>📄</span>
+                <span style={{ fontSize: 11.5, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 150 }}>{it.name}{it.truncated ? " (truncated)" : ""}</span>
+                <button onClick={() => onRemoveImage(i)} title="remove file" style={{ flexShrink: 0, border: "none", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 1px" }}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {pendingQuote && (
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 6, background: C.cardAlt, border: `1px solid ${C.hairline}`, borderLeft: `3px solid ${color}`, borderRadius: 7, padding: "6px 8px" }}>
+            <span style={{ color, fontSize: 12, lineHeight: "16px", flexShrink: 0 }}>❝</span>
+            <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontStyle: "italic", color: C.muted, lineHeight: 1.4, maxHeight: 54, overflow: "hidden" }}>{pendingQuote}</span>
+            <button onClick={onClearQuote} title="remove quoted context" style={{ flexShrink: 0, border: "none", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "0 2px" }}>×</button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <input ref={fileInputRef} type="file" accept="image/*,text/*,application/json,application/xml,.json,.jsonl,.ndjson,.txt,.md,.markdown,.csv,.tsv,.log,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.mjs,.cjs,.ts,.tsx,.py,.go,.rs,.java,.kt,.c,.cc,.cpp,.h,.hpp,.rb,.php,.swift,.sh,.bash,.sql,.graphql,.ini,.conf,.env,.gradle,.ipynb,.tex,.rst,.vue,.svelte" multiple style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files && e.target.files.length) onAddFiles(e.target.files); e.target.value = ""; }} />
+          <button onClick={() => fileInputRef.current && fileInputRef.current.click()} title="attach a file — image or text/data/code (paste or drop works too)"
+            style={{ flexShrink: 0, width: 30, height: 30, border: `1px solid ${C.hairline}`, background: C.card, color: C.muted, borderRadius: 8, cursor: "pointer", fontSize: 14, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>📎</button>
+          <input data-composer="1" value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") onSend(); }}
+            onPaste={(e) => { const files = Array.from(e.clipboardData && e.clipboardData.items || []).filter((it) => it.kind === "file" && it.type.startsWith("image/")).map((it) => it.getAsFile()).filter(Boolean); if (files.length) { e.preventDefault(); onAddFiles(files); } }}
+            placeholder={attachments && attachments.length ? "add a note, or just send…" : (pendingQuote ? "ask about the quote…" : (node.depth === 0 ? "ask anything…" : "ask about this…"))}
+            // translateZ(0) gives the input its own paint layer so the caret is computed relative to
+            // itself — keeps it correctly placed even when the canvas is zoomed to a fractional scale.
+            style={{ flex: 1, minWidth: 0, border: `1px solid ${C.hairline}`, borderRadius: 8, padding: "7px 9px", fontSize: 13, outline: "none", color: C.ink, background: C.canvas, transform: "translateZ(0)" }} />
+          <button onClick={onSend} disabled={node.loading} style={{ background: color, color: "#fff", border: "none", borderRadius: 8, padding: "0 12px", fontSize: 13, fontWeight: 600, cursor: node.loading ? "default" : "pointer", opacity: node.loading ? 0.5 : 1 }}>↑</button>
+        </div>
       </div>
 
       {/* resize grip */}
